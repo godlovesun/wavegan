@@ -9,9 +9,11 @@ import tensorflow as tf
 from six.moves import xrange
 
 import loader
-from specgan import SpecGANGenerator, SpecGANDiscriminator
+from specgan import SpecGANGenerator, SpecGANDiscriminator, SpecGANEncoder
 from functools import reduce
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'#don't show too much device information
 
 """
   Constants
@@ -21,6 +23,8 @@ _WINDOW_LEN = 16384
 _D_Z = 100
 _CLIP_NSTD = 3.
 _LOG_EPS = 1e-6
+_STATIC_PITCH_DIM = 20
+_STATIC_TRACT_DIM = 20
 
 
 """
@@ -101,15 +105,26 @@ def f_to_img(X_norm):
 """
 def train(fps, args):
   with tf.name_scope('loader'):
-    x_wav = loader.get_batch(fps, args.train_batch_size, _WINDOW_LEN, args.data_first_window)
-    x = t_to_f(x_wav, args.data_moments_mean, args.data_moments_std)
+    right_x_wav = loader.get_batch(fps, args.train_batch_size, _WINDOW_LEN, args.data_first_window)
+    right_x = t_to_f(right_x_wav, args.data_moments_mean, args.data_moments_std)
+    wrong_x_wav = loader.get_batch(fps, args.train_batch_size, _WINDOW_LEN, args.data_first_window)
+    wrong_x = t_to_f(wrong_x_wav, args.data_moments_mean, args.data_moments_std)
 
   # Make z vector
   z = tf.random_uniform([args.train_batch_size, _D_Z], -1., 1., dtype=tf.float32)
+  # static_condition means pitch
+  right_static_condition = tf.random_uniform([args.train_batch_size, _STATIC_PITCH_DIM], -1., 1., dtype=tf.float32)
+  wrong_static_condition = tf.random_uniform([args.train_batch_size, _STATIC_PITCH_DIM], -1., 1., dtype=tf.float32)
+
 
   # Make generator
   with tf.variable_scope('G'):
-    G_z = SpecGANGenerator(z, train=True, **args.specgan_g_kwargs)
+    # encode the spectrum into a vector
+    En_right_x = SpecGANEncoder(right_x)
+    En_wrong_x = SpecGANEncoder(wrong_x)
+    Condition_z = tf.concat([En_right_x, z, static_condition], 1)
+
+    G_z, G_z_static = SpecGANGenerator(Condition_z, train=True, **args.specgan_g_kwargs)
   G_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='G')
 
   # Print G summary
@@ -138,9 +153,13 @@ def train(fps, args):
   tf.summary.image('x', f_to_img(x))
   tf.summary.image('G_z', f_to_img(G_z))
 
-  # Make real discriminator
+  # Real input to discriminator
+  dynamic_x = tf.random_uniform([args.train_batch_size, 128, 128, 1], -1., 1., dtype=tf.float32)
+  static_x = tf.random_uniform([args.train_batch_size, _STATIC_TRACT_DIM], -1., 1., dtype=tf.float32)
+
+  # Make real-right discriminator
   with tf.name_scope('D_x'), tf.variable_scope('D'):
-    D_x = SpecGANDiscriminator(x, **args.specgan_d_kwargs)
+    real_logits = SpecGANDiscriminator(dynamic_x, static_x, En_right_x, right_static_condition, **args.specgan_d_kwargs)
   D_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='D')
 
   # Print D summary
@@ -155,9 +174,14 @@ def train(fps, args):
   print('Total params: {} ({:.2f} MB)'.format(nparams, (float(nparams) * 4) / (1024 * 1024)))
   print('-' * 80)
 
-  # Make fake discriminator
+  # Make real-wrong discriminator
   with tf.name_scope('D_G_z'), tf.variable_scope('D', reuse=True):
-    D_G_z = SpecGANDiscriminator(G_z, **args.specgan_d_kwargs)
+    wrong_logits = SpecGANDiscriminator(dynamic_x, static_x, En_wrong_x, wrong_static_condition, **args.specgan_d_kwargs)
+
+  # Make fake-right discriminator
+  with tf.name_scope('D_G_z'), tf.variable_scope('D', reuse=True):
+    fake_logits = SpecGANDiscriminator(G_z, G_z_static, En_right_x, right_static_condition, **args.specgan_d_kwargs)
+
 
   # Create loss
   D_clip_weights = None
@@ -166,20 +190,24 @@ def train(fps, args):
     real = tf.ones([args.train_batch_size], dtype=tf.float32)
 
     G_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-      logits=D_G_z,
+      logits=fake_logits,
       labels=real
     ))
 
-    D_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-      logits=D_G_z,
+    real_D_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+      logits=real_logits,
+      labels=real
+    ))
+    wrong_D_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+      logits=wrong_logits,
       labels=fake
     ))
-    D_loss += tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-      logits=D_x,
-      labels=real
+    fake_D_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+      logits=fake_logits,
+      labels=fake
     ))
-
-    D_loss /= 2.
+    D_loss = real_D_loss + (wrong_D_loss + fake_D_loss)/2.
+    
   elif args.specgan_loss == 'lsgan':
     G_loss = tf.reduce_mean((D_G_z - 1.) ** 2)
     D_loss = tf.reduce_mean((D_x - 1.) ** 2)

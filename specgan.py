@@ -41,13 +41,14 @@ def conv2d_transpose(
 
 
 """
-  Input: [None, 100]
+  Input: [None, in_dim], in_dim = z_dim + dynamic_c_dim + static_c_dim
   Output: [None, 128, 128, 1]
 """
 def SpecGANGenerator(
     z,
     kernel_len=5,
     dim=64,
+    out_static_dim=20,
     use_batchnorm=False,
     upsample='zeros',
     train=False):
@@ -59,7 +60,7 @@ def SpecGANGenerator(
     batchnorm = lambda x: x
 
   # FC and reshape for convolution
-  # [100] -> [4, 4, 1024]
+  # [in_dim] -> [4, 4, 1024]
   output = z
   with tf.variable_scope('z_project'):
     output = tf.layers.dense(output, 4 * 4 * dim * 16)
@@ -81,6 +82,15 @@ def SpecGANGenerator(
     output = batchnorm(output)
   output = tf.nn.relu(output)
 
+  # Static branch
+  # [16, 16, 256] -> [out_static_dim]
+  with tf.variable_scope('static_dense'):
+    # Flatten
+    static_out = tf.reshape(output, [batch_size, 16 * 16 * 256])
+    static_out = tf.layers.dense(static_out, out_static_dim)
+    static_out = tf.nn.tanh(static_out)
+
+  # Dynamic branch
   # Layer 2
   # [16, 16, 256] -> [32, 32, 128]
   with tf.variable_scope('upconv_2'):
@@ -109,7 +119,7 @@ def SpecGANGenerator(
     with tf.control_dependencies(update_ops):
       output = tf.identity(output)
 
-  return output
+  return output, static_out
 
 
 def lrelu(inputs, alpha=0.2):
@@ -118,12 +128,13 @@ def lrelu(inputs, alpha=0.2):
 
 """
   Input: [None, 128, 128, 1]
-  Output: [None] (linear) output
+  Output: [None, out_dim=100] output
 """
-def SpecGANDiscriminator(
+def SpecGANEncoder(
     x,
     kernel_len=5,
     dim=64,
+    out_dim=100,
     use_batchnorm=False):
   batch_size = tf.shape(x)[0]
 
@@ -172,8 +183,87 @@ def SpecGANDiscriminator(
 
   # Connect to single logit
   with tf.variable_scope('output'):
-    output = tf.layers.dense(output, 1)[:, 0]
+    output = tf.layers.dense(output, out_dim)
 
   # Don't need to aggregate batchnorm update ops like we do for the generator because we only use the discriminator for training
 
   return output
+
+"""
+  Input: 
+    dynamic_x: [None, 128, 128, 1]
+    static_x: [None, static_tract_dim=20]
+  Output: [None] (linear) output
+"""
+def SpecGANDiscriminator(
+    dynamic_x,
+    static_x,
+    dynamic_c,
+    static_c,
+    kernel_len=5,
+    dim=64,
+    dynamic_out_dim = 100,
+    static_out_dim = 50,
+    use_batchnorm=False):
+  batch_size = tf.shape(x)[0]
+
+  if use_batchnorm:
+    batchnorm = lambda x: tf.layers.batch_normalization(x, training=True)
+  else:
+    batchnorm = lambda x: x
+
+  # Layer 0
+  # [128, 128, 1] -> [64, 64, 64]
+  output = dynamic_x
+  with tf.variable_scope('downconv_0'):
+    output = tf.layers.conv2d(output, dim, kernel_len, 2, padding='SAME')
+  output = lrelu(output)
+
+  # Layer 1
+  # [64, 64, 64] -> [32, 32, 128]
+  with tf.variable_scope('downconv_1'):
+    output = tf.layers.conv2d(output, dim * 2, kernel_len, 2, padding='SAME')
+    output = batchnorm(output)
+  output = lrelu(output)
+
+  # Layer 2
+  # [32, 32, 128] -> [16, 16, 256]
+  with tf.variable_scope('downconv_2'):
+    output = tf.layers.conv2d(output, dim * 4, kernel_len, 2, padding='SAME')
+    output = batchnorm(output)
+  output = lrelu(output)
+
+  # Layer 3
+  # [16, 16, 256] -> [8, 8, 512]
+  with tf.variable_scope('downconv_3'):
+    output = tf.layers.conv2d(output, dim * 8, kernel_len, 2, padding='SAME')
+    output = batchnorm(output)
+  output = lrelu(output)
+
+  # Layer 4
+  # [8, 8, 512] -> [4, 4, 1024]
+  with tf.variable_scope('downconv_4'):
+    output = tf.layers.conv2d(output, dim * 16, kernel_len, 2, padding='SAME')
+    output = batchnorm(output)
+  output = lrelu(output)
+
+  # Flatten
+  output = tf.reshape(output, [batch_size, 4 * 4 * dim * 16])
+
+  # Connect to single logit
+  with tf.variable_scope('dynamic_out'):
+    output = tf.layers.dense(output, dynamic_out_dim)
+
+  # Static input transform
+  # [static_tract_dim] ->  [static_out_dim]
+  with tf.variable_scope('static_out'):
+    static_out = tf.layers.dense(static_x, static_out_dim)
+
+  # Concate dynamic, static information, dynamic_c, static_c information
+  with tf.variable_scope('output'):
+    all_output = tf.concat([output, static_out, dynamic_c, static_c], 1)
+    all_output = tf.layers.dense(all_output, 1)[:, 0]
+
+  # Don't need to aggregate batchnorm update ops like we do for the generator because we only use the discriminator for training
+
+  return all_output
